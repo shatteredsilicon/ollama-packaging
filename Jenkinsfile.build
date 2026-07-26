@@ -1,0 +1,330 @@
+/* groovylint-disable LineLength, NestedBlockDepth */
+
+@Library('shatteredsilicon') _
+
+pipeline {
+  agent {
+    label 'rpm-x86_64'
+  }
+
+  parameters {
+    string(name: 'UPSTREAM_TAG', description: 'Upstream Ollama tag, e.g. 0.20.2')
+    choice(name: 'EPEL', choices: ['10', '9', '8'], description: 'EPEL release version')
+    choice(name: 'ARCH', choices: ['x86_64'], description: 'Target architecture')
+    booleanParam(name: 'WITH_AVX', defaultValue: true, description: 'Build for AVX-capable targets. Disable to pass --without avx.')
+    string(name: 'THREAD_TS', defaultValue: '', description: 'Slack parent thread timestamp for watcher-triggered notifications')
+  }
+
+  environment {
+    RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID = 'rpm-package-server-target'
+    RPM_SIGNING_PRIVATE_KEY_CREDENTIALS_ID = 'rpm-signing-key-ollama'
+    RPM_SIGNING_PASSPHRASE_CREDENTIALS_ID = 'rpm-signing-passphrase-ollama'
+    RPM_SIGNING_PUBLIC_KEY = 'keys/RPM-GPG-KEY-ollama.pub'
+    SLACK_WEBHOOK_CREDENTIALS_ID = 'slack-webhook-url'
+    SLACK_BOT_TOKEN_CREDENTIALS_ID = 'slack-bot-token'
+    SLACK_CHANNEL_ID_CREDENTIALS_ID = 'slack-channel-id'
+  }
+
+  options {
+    buildDiscarder(logRotator(
+      numToKeepStr: '3',
+      artifactNumToKeepStr: '3'
+    ))
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  stages {
+    stage('Initialize') {
+      steps {
+        script {
+          ci.validateRequiredParameters(
+            [UPSTREAM_TAG: params.UPSTREAM_TAG],
+            ['UPSTREAM_TAG']
+          )
+
+          String releaseTag = params.UPSTREAM_TAG.trim().replaceFirst(/^v/, '')
+          if (!(releaseTag ==~ /[A-Za-z0-9][A-Za-z0-9._+~]*/)) {
+            error("UPSTREAM_TAG resolved to an invalid RPM version: '${releaseTag}'")
+          }
+
+          org.shatteredsilicon.jenkins.model.BuildTarget target = rpm.resolveTarget(
+            release: params.EPEL ?: '10',
+            arch: params.ARCH ?: 'x86_64',
+            supportedReleases: ['8', '9', '10'],
+            supportedArches: ['x86_64'],
+            mockTarget: "alma+epel+cuda-${params.EPEL ?: '10'}-${params.ARCH ?: 'x86_64'}"
+          )
+
+          Map<String, String> externalConfiguration = [
+            RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID: env.RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID,
+            RPM_SIGNING_PRIVATE_KEY_CREDENTIALS_ID: env.RPM_SIGNING_PRIVATE_KEY_CREDENTIALS_ID,
+            RPM_SIGNING_PASSPHRASE_CREDENTIALS_ID: env.RPM_SIGNING_PASSPHRASE_CREDENTIALS_ID,
+            RPM_SIGNING_PUBLIC_KEY: env.RPM_SIGNING_PUBLIC_KEY,
+            SLACK_WEBHOOK_CREDENTIALS_ID: env.SLACK_WEBHOOK_CREDENTIALS_ID,
+            SLACK_BOT_TOKEN_CREDENTIALS_ID: env.SLACK_BOT_TOKEN_CREDENTIALS_ID,
+            SLACK_CHANNEL_ID_CREDENTIALS_ID: env.SLACK_CHANNEL_ID_CREDENTIALS_ID
+          ]
+          ci.validateRequiredParameters(externalConfiguration, externalConfiguration.keySet())
+
+          env.RELEASE_TAG = releaseTag
+          env.RELEASEVER = target.release
+          env.BASEARCH = target.arch
+          env.MOCK_TARGET_NAME = target.mockTarget
+          env.WITH_AVX_VALUE = params.WITH_AVX ? 'true' : 'false'
+          env.WITHOUT_AVX_VALUE = params.WITH_AVX ? 'false' : 'true'
+        }
+        echo "Using upstream Ollama version: ${env.RELEASE_TAG}"
+        echo "Using EPEL release: ${env.RELEASEVER}"
+        echo "Using architecture: ${env.BASEARCH}"
+        echo "Using AVX mode: ${env.WITH_AVX_VALUE == 'true' ? 'enabled' : 'disabled'}"
+        echo "Using Mock target: ${env.MOCK_TARGET_NAME}"
+      }
+    }
+
+    stage('Validate build node') {
+      steps {
+        script {
+          ci.validateBuildNode(
+            expectedArchitecture: env.BASEARCH,
+            requiredCommands: [
+              'git',
+              'go',
+              'gpg',
+              'jq',
+              'mock',
+              'python3',
+              'rpm',
+              'rpmkeys',
+              'rpmbuild',
+              'rpmsign',
+              'scp',
+              'ssh',
+              'tar',
+              'wget'
+            ],
+            mockTarget: env.MOCK_TARGET_NAME
+          )
+        }
+      }
+    }
+
+    stage('Prepare workspace') {
+      steps {
+        script {
+          ci.prepareWorkspace(
+            clean: ['work', 'artifacts'],
+            create: ['work', 'artifacts']
+          )
+        }
+        sh(
+          script: '''
+            set -euo pipefail
+            test -s "$RPM_SIGNING_PUBLIC_KEY"
+            cp -a rpmbuild work/rpmbuild
+            git clone --branch "v$RELEASE_TAG" --depth 1 \
+              https://github.com/ollama/ollama.git \
+              work/ollama-upstream
+          '''
+        )
+      }
+    }
+
+    stage('Sanity check patch stack') {
+      steps {
+        sh(
+          script: '''
+            set -euo pipefail
+            python3 scripts/ollama_check_patches.py \
+              --spec-file=work/rpmbuild/SPECS/ollama.spec \
+              --patch-dir=work/rpmbuild/SOURCES \
+              --source-dir=work/ollama-upstream \
+              --without-avx="$WITHOUT_AVX_VALUE"
+          '''
+        )
+      }
+    }
+
+    stage('Prepare source') {
+      steps {
+        sh(
+          script: '''
+            set -euo pipefail
+            cd work/rpmbuild/SOURCES
+            chmod +x prep-ollama.sh
+            ./prep-ollama.sh "$RELEASE_TAG"
+          '''
+        )
+      }
+    }
+
+    stage('Build source RPM') {
+      steps {
+        script {
+          rpm.updateSpec(
+            specFile: 'work/rpmbuild/SPECS/ollama.spec',
+            version: env.RELEASE_TAG,
+            versionMacro: 'upstream_version',
+            preserveVersionField: true
+          )
+        }
+
+        sh(
+          script: '''
+            set -euo pipefail
+            mkdir -p work/rpmbuild/BUILD work/rpmbuild/BUILDROOT work/rpmbuild/RPMS work/rpmbuild/SRPMS
+
+            rpmbuild -bs \
+              --define "_topdir $WORKSPACE/work/rpmbuild" \
+              --define "rhel $RELEASEVER" \
+              --define "dist .el$RELEASEVER" \
+              work/rpmbuild/SPECS/ollama.spec
+
+            find work/rpmbuild/SRPMS -maxdepth 1 -type f \
+              -name "ollama-$RELEASE_TAG-*.src.rpm" \
+              -print -quit | grep -q .
+          '''
+        )
+      }
+    }
+
+    stage('Build RPM with Mock') {
+      steps {
+        script {
+          rpm.mockBuild(
+            mockTarget: env.MOCK_TARGET_NAME,
+            sourceRpm: "work/rpmbuild/SRPMS/ollama-${env.RELEASE_TAG}-*.src.rpm",
+            artifactDirectory: 'artifacts',
+            rpmbuildOptions: params.WITH_AVX
+              ? ['--with', 'avx']
+              : ['--without', 'avx'],
+            artifactPatterns: [
+              "ollama-${env.RELEASE_TAG}-*.rpm",
+              '*.log',
+              '*.cfg',
+              '*.state'
+            ],
+            requiredArtifactPatterns: [
+              "ollama-${env.RELEASE_TAG}-*.${env.BASEARCH}.rpm",
+              "ollama-${env.RELEASE_TAG}-*.src.rpm"
+            ]
+          )
+        }
+      }
+    }
+
+    stage('Sign RPMs') {
+      steps {
+        script {
+          rpm.sign(
+            artifactsDirectory: 'artifacts',
+            privateKeyCredentialsId: env.RPM_SIGNING_PRIVATE_KEY_CREDENTIALS_ID,
+            passphraseCredentialsId: env.RPM_SIGNING_PASSPHRASE_CREDENTIALS_ID,
+            publicKeyFile: env.RPM_SIGNING_PUBLIC_KEY
+          )
+        }
+      }
+    }
+
+    stage('Publish RPMs') {
+      steps {
+        script {
+          rpm.publish(
+            targetCredentialsId: env.RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID,
+            artifactsDirectory: 'artifacts',
+            destinations: [
+              [
+                include: '*.src.rpm',
+                remoteDirectory: "ollama/${env.RELEASEVER}/SRPMS"
+              ],
+              [
+                include: '*.rpm',
+                exclude: ['*.src.rpm'],
+                remoteDirectory: "ollama/${env.RELEASEVER}/RPMS/${env.BASEARCH}",
+                refreshMetadata: true
+              ]
+            ],
+            publicKey: [
+              file: env.RPM_SIGNING_PUBLIC_KEY,
+              remoteDirectory: 'ollama'
+            ]
+          )
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        ci.archiveDiagnostics(
+          directory: 'artifacts',
+          include: ['**/*'],
+          exclude: ['**/*.rpm'],
+          allowEmpty: true,
+          fingerprint: true
+        )
+
+        if (env.RELEASEVER == '10') {
+          slackNotify(
+            status: 'success',
+            message: "Built, signed, and published Ollama ${env.RELEASE_TAG} for EPEL ${env.RELEASEVER} / ${env.BASEARCH} using Mock target ${env.MOCK_TARGET_NAME}. Check Jenkins build: ${env.BUILD_URL}",
+            pipelineName: 'Ollama RPM pipeline',
+            threadTs: params.THREAD_TS,
+            webhookCredentialsId: env.SLACK_WEBHOOK_CREDENTIALS_ID,
+            botTokenCredentialsId: env.SLACK_BOT_TOKEN_CREDENTIALS_ID,
+            channelIdCredentialsId: env.SLACK_CHANNEL_ID_CREDENTIALS_ID,
+            returnStdout: false
+          )
+        }
+      }
+    }
+
+    failure {
+      script {
+        ci.archiveDiagnostics(
+          directory: 'artifacts',
+          include: ['**/*'],
+          exclude: ['**/*.rpm'],
+          allowEmpty: true,
+          fingerprint: true
+        )
+
+        String releaseTag = (env.RELEASE_TAG ?: params.UPSTREAM_TAG ?: 'unknown').trim()
+        String releasever = (env.RELEASEVER ?: params.EPEL ?: 'unknown').trim()
+        String basearch = (env.BASEARCH ?: params.ARCH ?: 'unknown').trim()
+        String mockTarget = (env.MOCK_TARGET_NAME ?: "alma+epel+cuda-${releasever}-${basearch}").trim()
+        String avxLabel = (env.WITH_AVX_VALUE ?: params.WITH_AVX?.toString() ?: 'unknown') == 'true'
+          ? 'with AVX'
+          : 'without AVX'
+        Map<String, String> slackCredentialIds = [
+          webhookCredentialsId: (env.SLACK_WEBHOOK_CREDENTIALS_ID ?: '').trim(),
+          botTokenCredentialsId: (env.SLACK_BOT_TOKEN_CREDENTIALS_ID ?: '').trim(),
+          channelIdCredentialsId: (env.SLACK_CHANNEL_ID_CREDENTIALS_ID ?: '').trim()
+        ]
+
+        if (releasever == '10' &&
+            slackCredentialIds.values().every { String value -> value }) {
+          slackNotify(
+            status: 'failure',
+            message: "Build failed for Ollama ${releaseTag} for EPEL ${releasever} / ${basearch} ${avxLabel} using Mock target ${mockTarget}. Check Jenkins build: ${env.BUILD_URL}",
+            pipelineName: 'Ollama RPM pipeline',
+            threadTs: params.THREAD_TS,
+            webhookCredentialsId: slackCredentialIds.webhookCredentialsId,
+            botTokenCredentialsId: slackCredentialIds.botTokenCredentialsId,
+            channelIdCredentialsId: slackCredentialIds.channelIdCredentialsId,
+            returnStdout: false
+          )
+        } else if (releasever == '10') {
+          echo 'Slack failure notification skipped because credential IDs are not configured.'
+        }
+      }
+    }
+
+    cleanup {
+      script {
+        ci.cleanup(directories: ['work', 'artifacts'])
+      }
+    }
+  }
+}

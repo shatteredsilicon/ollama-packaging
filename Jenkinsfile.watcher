@@ -1,0 +1,127 @@
+/* groovylint-disable LineLength */
+
+@Library('shatteredsilicon') _
+
+pipeline {
+  agent {
+    label 'rpm-x86_64'
+  }
+
+  parameters {
+    choice(name: 'EPEL', choices: ['10', '9', '8'], description: 'EPEL release version')
+    choice(name: 'ARCH', choices: ['x86_64'], description: 'Target architecture')
+  }
+
+  triggers {
+    cron('H H * * *')
+  }
+
+  environment {
+    OLLAMA_BUILD_JOB = 'ollama/build-ollama-rpm'
+    RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID = 'rpm-package-server-target'
+    SLACK_WEBHOOK_CREDENTIALS_ID = 'slack-webhook-url'
+    SLACK_BOT_TOKEN_CREDENTIALS_ID = 'slack-bot-token'
+    SLACK_CHANNEL_ID_CREDENTIALS_ID = 'slack-channel-id'
+  }
+
+  options {
+    buildDiscarder(logRotator(
+      numToKeepStr: '5',
+      artifactNumToKeepStr: '5'
+    ))
+    disableConcurrentBuilds()
+    skipDefaultCheckout(true)
+    timestamps()
+  }
+
+  stages {
+    stage('Check latest release') {
+      steps {
+        script {
+          org.shatteredsilicon.jenkins.model.BuildTarget target = rpm.resolveTarget(
+            release: params.EPEL ?: '10',
+            arch: params.ARCH ?: 'x86_64',
+            supportedReleases: ['8', '9', '10'],
+            supportedArches: ['x86_64'],
+            mockTarget: "alma+epel+cuda-${params.EPEL ?: '10'}-${params.ARCH ?: 'x86_64'}"
+          )
+
+          Map<String, String> externalConfiguration = [
+            OLLAMA_BUILD_JOB: env.OLLAMA_BUILD_JOB,
+            RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID: env.RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID,
+            SLACK_WEBHOOK_CREDENTIALS_ID: env.SLACK_WEBHOOK_CREDENTIALS_ID,
+            SLACK_BOT_TOKEN_CREDENTIALS_ID: env.SLACK_BOT_TOKEN_CREDENTIALS_ID,
+            SLACK_CHANNEL_ID_CREDENTIALS_ID: env.SLACK_CHANNEL_ID_CREDENTIALS_ID
+          ]
+          ci.validateRequiredParameters(externalConfiguration, externalConfiguration.keySet())
+
+          org.shatteredsilicon.jenkins.model.RpmWatcherResult result = rpmWatcher(
+            pipelineName: 'Ollama RPM pipeline',
+            architecture: target.arch,
+            name: 'ollama',
+            supportedArches: ['x86_64'],
+            release: [
+              provider: 'github',
+              repository: 'ollama/ollama'
+            ],
+            repository: [
+              targetCredentialsId: externalConfiguration.RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID,
+              remoteDirectory: "ollama/${target.release}/RPMS/${target.arch}",
+              packageName: 'ollama',
+              architecture: target.arch
+            ],
+            builds: [
+              [
+                job: externalConfiguration.OLLAMA_BUILD_JOB,
+                versionParameter: 'UPSTREAM_TAG',
+                threadParameter: 'THREAD_TS',
+                parameters: [
+                  EPEL: target.release,
+                  ARCH: target.arch,
+                  WITH_AVX: true
+                ],
+                wait: false
+              ]
+            ],
+            notification: [
+              enabled: target.release == '10',
+              webhookCredentialsId: externalConfiguration.SLACK_WEBHOOK_CREDENTIALS_ID,
+              botTokenCredentialsId: externalConfiguration.SLACK_BOT_TOKEN_CREDENTIALS_ID,
+              channelIdCredentialsId: externalConfiguration.SLACK_CHANNEL_ID_CREDENTIALS_ID
+            ]
+          )
+
+          echo "Ollama watcher result for EPEL ${target.release} / ${target.arch}: rebuilds=${result.rebuilds.size()}, current=${result.current.size()}, skipped=${result.skipped.size()}, triggered=${result.triggeredBuilds.size()}"
+        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      script {
+        String releasever = (params.EPEL ?: 'unknown').trim()
+        Map<String, String> slackCredentialIds = [
+          webhookCredentialsId: (env.SLACK_WEBHOOK_CREDENTIALS_ID ?: '').trim(),
+          botTokenCredentialsId: (env.SLACK_BOT_TOKEN_CREDENTIALS_ID ?: '').trim(),
+          channelIdCredentialsId: (env.SLACK_CHANNEL_ID_CREDENTIALS_ID ?: '').trim()
+        ]
+
+        if (releasever == '10' &&
+            slackCredentialIds.values().every { String value -> value }) {
+          slackNotify(
+            status: 'error',
+            message: "Ollama watcher failed for EPEL ${releasever} / ${params.ARCH}. Check Jenkins build: ${env.BUILD_URL}",
+            pipelineName: 'Ollama RPM pipeline',
+            webhookCredentialsId: slackCredentialIds.webhookCredentialsId,
+            botTokenCredentialsId: slackCredentialIds.botTokenCredentialsId,
+            channelIdCredentialsId: slackCredentialIds.channelIdCredentialsId,
+            returnStdout: false
+          )
+        } else if (releasever == '10') {
+          echo 'Slack failure notification skipped because credential IDs are not configured.'
+        }
+      }
+    }
+  }
+}

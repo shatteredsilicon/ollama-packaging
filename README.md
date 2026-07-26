@@ -1,6 +1,31 @@
 # ollama-noavx
 Ollama Without mandatory AVX CPU Requirement and other enhancements
 
+## Repository layout
+
+~~~~ {.text}
+ollama-noavx/
+├── README.md
+├── LICENSE
+├── Jenkinsfile.watcher
+├── Jenkinsfile.build
+├── keys/
+│   └── RPM-GPG-KEY-ollama.pub
+├── scripts/
+│   └── ollama_check_patches.py
+└── rpmbuild/
+    ├── SOURCES/
+    │   ├── prep-ollama.sh
+    │   └── ...
+    └── SPECS/
+        ├── cuda-virtual-provides.spec
+        └── ollama.spec
+~~~~
+
+The non-secret RPM public key is stored in this repository for package signing
+verification and publication. The private signing key and passphrase remain
+protected by Jenkins credentials.
+
 # Additional features
 - Can be built on/for CPUs with limited or no AVX support.
 

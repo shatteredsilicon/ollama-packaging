@@ -1,0 +1,26 @@
+diff --git a/llama/compat/900-shatteredsilicon-cpu-variants.patch b/llama/compat/900-shatteredsilicon-cpu-variants.patch
+new file mode 100644
+index 00000000..2c0597f0
+--- /dev/null
++++ b/llama/compat/900-shatteredsilicon-cpu-variants.patch
+@@ -0,0 +1,20 @@
++diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
++index 11583474a..b4108183e 100644
++--- a/ggml/src/CMakeLists.txt
+++++ b/ggml/src/CMakeLists.txt
++@@ -322,7 +322,15 @@ function(ggml_add_backend backend)
++     endif()
++ endfunction()
++ 
+++set(GGML_CPU_VARIANTS "" CACHE STRING
+++    "Semicolon-separated CPU backend variants to build when GGML_CPU_ALL_VARIANTS is enabled")
+++
++ function(ggml_add_cpu_backend_variant tag_name)
+++    if (GGML_CPU_VARIANTS AND NOT tag_name IN_LIST GGML_CPU_VARIANTS)
+++        message(STATUS "Skipping CPU backend variant ${tag_name}")
+++        return()
+++    endif()
+++
++     set(GGML_CPU_TAG_NAME ${tag_name})
++     # other: OPENMP LLAMAFILE CPU_HBM
++     if (GGML_SYSTEM_ARCH STREQUAL "x86")

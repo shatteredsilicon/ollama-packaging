@@ -2,7 +2,7 @@
 
 %bcond_without avx
 
-%{!?upstream_version:%{error:upstream_version must be defined, e.g. rpmbuild --define 'upstream_version 0.21.0'}}
+%{!?upstream_version:%{error:upstream_version must be defined, e.g. rpmbuild --define 'upstream_version 0.32.5'}}
 
 Name:           ollama
 Version:        %{upstream_version}
@@ -10,21 +10,19 @@ Release:        1%{?dist}
 Summary:        Tool for running AI models on-premise
 License:        MIT
 URL:            https://ollama.com
-Source:         %{name}-%{upstream_version}.tar.gz
+Source0:        %{name}-%{upstream_version}.tar.gz
 Source1:        %{name}-%{upstream_version}-vendor.tar.gz
-Source2:        %{name}.service
-Source3:        %{name}-user.conf
-Patch0:         ollama-disable-avx512.patch
-Patch1:         remove-redundant-backends.patch
-Patch2:         fix-linking-stdcppfs.patch
-Patch3:         optimize-gpu-compiler.patch
-Patch4:         support-all-compute-models-for-cuda12.patch
-Patch5:         enable-lto.patch
-Patch6:         ollama-disable-avx.patch
-Patch7:         support-overriding-tensor-split.patch
+Source2:        %{name}-%{upstream_version}-llama.cpp.tar.gz
+Source3:        %{name}.service
+Source4:        %{name}-user.conf
+Patch0:         restrict-llama-cpu-variants.patch
+Patch1:         support-overriding-tensor-split.patch
 BuildRequires:  cmake >= 3.24
+BuildRequires:  git-core
+BuildRequires:  make
+BuildRequires:  redhat-rpm-config
 BuildRequires:  zstd
-BuildRequires:  golang >= 1.24.1
+BuildRequires:  golang >= 1.26.0
 BuildRequires:  gcc-c++
 BuildRequires:  libstdc++
 BuildRequires:  systemd-rpm-macros
@@ -46,70 +44,89 @@ Source model weights found on Hugging Face and similar sites
 can be imported.
 
 %prep
-%setup
-%setup -D -a 1
+%setup -q
+%setup -q -D -a 1
+%setup -q -D -a 2
 
+%patch 0 -p1
 %patch 1 -p1
 
-%if %{with avx}
-# default: AVX/AVX2 allowed -> only disable AVX512
-%patch 0 -p1
-%else
-# --without avx: no AVX at all
-%patch 6 -p1
-%endif
-
-%patch 2 -p1
-%patch 3 -p1
-%patch 4 -p1
-%patch 5 -p1
-%patch 7 -p1
+# The root Ollama superbuild treats OLLAMA_LLAMA_CPP_SOURCE as an already
+# prepared tree. Apply Ollama's compatibility patch set, including the local
+# CPU-variant allowlist patch, before configuring the build.
+(
+  cd llama.cpp
+  cmake \
+    -DPATCH_DIR="$PWD/../llama/compat" \
+    -P "$PWD/../llama/compat/apply-patch.cmake"
+)
 
 %build
-export CFLAGS='-ffunction-sections -fdata-sections -flto -Wl,--gc-sections -Wl,--strip-all'
-export CXXFLAGS=$CFLAGS
-export LDFLAGS='-flto -Wl,--gc-sections -Wl,--strip-all -lstdc++fs'
+%set_build_flags
+export CFLAGS="${CFLAGS} -ffunction-sections -fdata-sections"
+export CXXFLAGS="${CXXFLAGS} -ffunction-sections -fdata-sections"
+export LDFLAGS="${LDFLAGS} -Wl,--gc-sections"
+export GIN_MODE=release
+export GOFLAGS="-mod=vendor -buildvcs=false"
+export CGO_ENABLED=1
+export OLLAMA_LLAMA_CPP_SOURCE="$PWD/llama.cpp"
+
+# RHEL-family RPM builds link executables as PIE through the hardened linker
+# specs. CUDA 13's compiler probe otherwise compiles a non-PIC host object and
+# fails while linking the test executable. Ollama forwards CMAKE_CUDA_FLAGS to
+# each nested llama-server CUDA ExternalProject, so pass the host PIC flag
+# through nvcc explicitly.
+export CUDAFLAGS="${CUDAFLAGS:+$CUDAFLAGS }-Xcompiler=-fPIC"
+
+%if %{with avx}
+# Build baseline, SSE4.2, AVX and AVX2 CPU modules, but no AVX-VNNI/AVX-512/AMX modules.
+export OLLAMA_CPU_VARIANTS='x64;sse42;sandybridge;ivybridge;piledriver;haswell'
+%else
+# GOAMD64=v2 requires SSE4.2 but does not enable AVX instructions.
+export GOAMD64=v2
+export OLLAMA_CPU_VARIANTS='x64;sse42'
+%endif
+
 %if 0%{?rhel} <= 9
 export PATH=/usr/local/cuda-12/bin:$PATH
 %else
 export PATH=/usr/local/cuda-13/bin:$PATH
 %endif
-export GIN_MODE=release
-export GOFLAGS="-mod=vendor -ldflags=-s -ldflags=-w -buildvcs=false"
-export CGO_ENABLED=1
 
-%if !%{with avx}
-export GOAMD64=v2
-%endif
-
-# Run unit tests prior to building binaries to catch regressions early
-#GIN_MODE=test go test -v ./...
-
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=%{_prefix} \
+  -DOLLAMA_VERSION=%{version} \
+  -DGGML_CPU_VARIANTS="$OLLAMA_CPU_VARIANTS" \
+  -DCMAKE_CUDA_FLAGS="$CUDAFLAGS" \
+  -DGGML_LTO=ON \
 %if 0%{?rhel} <= 9
-cmake --preset="CUDA 12"
+  -DOLLAMA_LLAMA_BACKENDS=cuda_v12 \
+  -DCUDAToolkit_ROOT=/usr/local/cuda-12
 %else
-cmake --preset="CUDA 13" -DCMAKE_CUDA_ARCHITECTURES="75;86;89;90"
+  -DOLLAMA_LLAMA_BACKENDS=cuda_v13 \
+  -DCUDAToolkit_ROOT=/usr/local/cuda-13 \
+  -DCMAKE_CUDA_ARCHITECTURES='75;86;89;90'
 %endif
-cmake --build build --config Release %{?_smp_mflags}
-go build -v .
-strip %{name}
+
+cmake --build build --parallel %{?_smp_build_ncpus}
 
 %install
-%{__install} -p -D -m 0644 %{SOURCE3} %{buildroot}%{_sysusersdir}/%{name}.conf
-%{__install} -D -m 0755 %{name} %{buildroot}/%{_bindir}/%{name}
+cmake --install build \
+  --prefix %{buildroot}%{_prefix} \
+  --component ollama-local
+
+%{__install} -p -D -m 0644 %{SOURCE4} %{buildroot}%{_sysusersdir}/%{name}.conf
 %{__install} -d %{buildroot}%{_localstatedir}/lib/%{name}
 
-%{__install} -d %{buildroot}/usr/lib/systemd/system
-%{__install} -p -m 0644 %{SOURCE2} %{buildroot}/usr/lib/systemd/system/%{name}.service
-
-%{__install} -d %{buildroot}%{_prefix}/lib/ollama
-cp -r build/lib/ollama/* %{buildroot}%{_prefix}/lib/ollama
+%{__install} -d %{buildroot}%{_unitdir}
+%{__install} -p -m 0644 %{SOURCE3} %{buildroot}%{_unitdir}/%{name}.service
 
 mkdir -p "%{buildroot}/%{_docdir}/%{name}"
 cp -Ra docs/* "%{buildroot}/%{_docdir}/%{name}"
 
 %pre
-%sysusers_create_compat %{SOURCE3}
+%sysusers_create_compat %{SOURCE4}
 
 %post
 %systemd_post %{name}.service
@@ -131,115 +148,3 @@ cp -Ra docs/* "%{buildroot}/%{_docdir}/%{name}"
 %attr(-, ollama, ollama) %{_localstatedir}/lib/%{name}
 
 %changelog
-* Sat Apr 04 2026 Gordan Bobic <gordan@shatteredsilicon.net> - 0.20.2-1
-- Update to version 0.20.2
-
-* Fri Apr 03 2026 Gordan Bobic <gordan@shatteredsilicon.net> - 0.20.0-1
-- Update to version 0.20.0
-
-* Tue Mar 31 2026 Gordan Bobic <gordan@shatteredsilicon.net> - 0.19.0-1
-- Update to version 0.19.0
-
-* Sat Mar 28 2026 Gordan Bobic <gordan@shatteredsilicon.net> - 0.18.3-1
-- Update to version 0.18.3
-
-* Sat Mar 28 2026 Gordan Bobic <gordan@shatteredsilicon.net> - 0.18.2-1
-- Update to version 0.18.2
-
-* Sun Mar 8 2026 Gordan Bobic <gordan@shatteredsilicon.net> - 0.17.7-1
-- Update to version 0.17.7
-
-* Thu Mar 5 2026 Thien Nguyen <nthien86@gmail.com> - 0.17.6-1
-- Update to version 0.17.6
-- Enable tensor-split-override.
-
-* Fri Jan 30 2026 <gordan@shatteredsilicon.net> - 0.15.2-3
-- Update to 0.15.2
-- Disable tensor-split-override.
-
-* Mon Jan 19 2026 <gordan@shatteredsilicon.net> - 0.14.2-3
-- Update to 0.14.2
-
-* Sun Jan 18 2026 <gordan@shatteredsilicon.net> - 0.14.1-3
-- Update to 0.14.1
-
-* Wed Dec 24 2025 <gordan@shatteredsilicon.net> - 0.13.5-4
-- with AVX2 by default
-
-* Tue Dec 23 2025 <gordan@shatteredsilicon.net> - 0.13.5-3
-- Update to 0.13.5
-
-* Fri Dec 12 2025 <gordan@shatteredsilicon.net> - 0.13.3-1
-- Update to 0.13.3
-
-* Wed Dec 03 2025 <gordan@shatteredsilicon.net> - 0.13.1-1
-- Update to 0.13.1
-
-* Thu Nov 20 2025 <gordan@shatteredsilicon.net> - 0.13.0-1
-- Update to 0.13.0
-
-* Wed Nov 19 2025 Thien Nguyen <nthien86@gmail.com> - 0.12.11-1
-- Update to version 0.12.11
-- Add support for building with or without AVX
-- Support overriding tensor-split
-
-* Fri Sep 26 2025 <gordan@shatteredsilicon.net> - 0.12.2-1
-- Update to 0.12.2
-
-* Thu Sep 11 2025 <gordan@shatteredsilicon.net> - 0.11.10-1
-- Update to 0.11.10
-
-* Tue Aug 26 2025 <gordan@shatteredsilicon.net> - 0.11.7-1
-- Update to 0.11.7
-
-* Fri Aug 22 2025 <gordan@shatteredsilicon.net> - 0.11.6-1
-- Update to 0.11.6
-
-* Wed Aug 20 2025 <gordan@shatteredsilicon.net> - 0.11.5-1
-- Update to 0.11.5
-
-* Sun Aug 10 2025 <gordan@shatteredsilicon.net> - 0.11.4-1
-- Update to 0.11.4
-
-* Wed Aug 06 2025 <gordan@shatteredsilicon.net> - 0.11.3-1
-- Update to 0.11.3
-
-* Tue Aug 05 2025 <gordan@shatteredsilicon.net> - 0.11.0-1
-- Update to 0.11.0
-
-* Thu Jul 31 2025 <gordan@shatteredsilicon.net> - 0.10.1-1
-- Update to 0.10.1
-
-* Wed Jul 09 2025 <gordan@shatteredsilicon.net> - 0.9.6-1
-- Update to 0.9.6
-
-* Sun Jul 06 2025 <gordan@shatteredsilicon.net> - 0.9.5-1
-- Update to 0.9.5
-
-* Fri Jun 20 2025 <gordan@shatteredsilicon.net> - 0.9.2-1
-- Update to 0.9.2
-
-* Wed Jun 18 2025 <gordan@shatteredsilicon.net> - 0.9.1-1
-- Update to 0.9.1
-
-* Sat May 10 2025 <gordan@shatteredsilicon.net> - 0.6.8-1
-- Update to 0.6.8
-
-* Sun Apr 27 2025 <gordan@shatteredsilicon.net> - 0.6.6-1
-- Update to 0.6.6
-
-* Sat Apr 12 2025 <nthien86@gmail.com> - 0.6.5-1
-- 0.6.5 patched to disable AVX requirements
-
-* Thu Apr 03 2025 <nthien86@gmail.com> - 0.6.2-1
-- 0.6.2 patched to disable AVX requirements
-
-* Mon Mar 17 2025 <nthien86@gmail.com> - 0.6.1-1
-- 0.6.1 patched to disable AVX requirements
-
-* Sun Mar 16 2025 <nthien86@gmail.com> - 0.6.0-1
-- 0.6.0 patched to disable AVX requirements
-
-* Wed Feb 19 2025 <nthien86@gmail.com> - 0.5.11-1
-- Initial release with 0.5.11 patched to disable AVX requirements
-- CUDA 11 only, compute model 3.5 - 9.0

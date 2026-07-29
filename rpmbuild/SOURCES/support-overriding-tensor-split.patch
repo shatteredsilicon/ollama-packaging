@@ -1,154 +1,160 @@
-diff -Nru '--exclude=.git' ollama-0.23.4.org/envconfig/config.go ollama-0.23.4/envconfig/config.go
---- ollama-0.23.4.org/envconfig/config.go	2026-05-14 22:42:40.015139609 +0700
-+++ ollama-0.23.4/envconfig/config.go	2026-05-14 23:33:16.037786991 +0700
-@@ -234,6 +234,9 @@
- 	UseAuth = Bool("OLLAMA_AUTH")
- 	// Enable Vulkan backend
- 	EnableVulkan = Bool("OLLAMA_VULKAN")
-+	// Optional path to per-model override file (INI).
-+	// If unset, defaults to ~/.ollama.ini
-+	OverrideConfigPath = String("OLLAMA_OVERRIDE_CONFIG")
- 	// NoCloudEnv checks the OLLAMA_NO_CLOUD environment variable.
- 	NoCloudEnv = Bool("OLLAMA_NO_CLOUD")
- )
-@@ -334,6 +337,7 @@
- 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
- 		"OLLAMA_NEW_ENGINE":           {"OLLAMA_NEW_ENGINE", NewEngine(), "Enable the new Ollama engine"},
- 		"OLLAMA_REMOTES":              {"OLLAMA_REMOTES", Remotes(), "Allowed hosts for remote models (default \"ollama.com\")"},
-+		"OLLAMA_OVERRIDE_CONFIG":      {"OLLAMA_OVERRIDE_CONFIG", OverrideConfigPath(), "Path to model override config (default: ~/.ollama.ini)"},
+diff --git a/envconfig/config.go b/envconfig/config.go
+index 61a2c7c..0e3f9e5 100644
+--- a/envconfig/config.go
++++ b/envconfig/config.go
+@@ -245,8 +245,9 @@ func String(s string) func() string {
+ }
  
- 		// Informational
- 		"HTTP_PROXY":  {"HTTP_PROXY", String("HTTP_PROXY")(), "HTTP proxy"},
-diff -Nru '--exclude=.git' ollama-0.23.4.org/envconfig/override.go ollama-0.23.4/envconfig/override.go
---- ollama-0.23.4.org/envconfig/override.go	1970-01-01 08:00:00.000000000 +0800
-+++ ollama-0.23.4/envconfig/override.go	2026-05-14 23:06:38.712216956 +0700
-@@ -0,0 +1,122 @@
+ var (
+-	LLMLibrary = String("OLLAMA_LLM_LIBRARY")
+-	Editor     = String("OLLAMA_EDITOR")
++	LLMLibrary         = String("OLLAMA_LLM_LIBRARY")
++	Editor             = String("OLLAMA_EDITOR")
++	OverrideConfigPath = String("OLLAMA_OVERRIDE_CONFIG")
+ 
+ 	CudaVisibleDevices    = String("CUDA_VISIBLE_DEVICES")
+ 	HipVisibleDevices     = String("HIP_VISIBLE_DEVICES")
+@@ -332,6 +333,7 @@ func AsMap() map[string]EnvVar {
+ 		"OLLAMA_NOPRUNE":              {"OLLAMA_NOPRUNE", NoPrune(), "Do not prune model blobs on startup"},
+ 		"OLLAMA_NUM_PARALLEL":         {"OLLAMA_NUM_PARALLEL", NumParallel(), "Maximum number of parallel requests"},
+ 		"OLLAMA_ORIGINS":              {"OLLAMA_ORIGINS", AllowedOrigins(), "A comma separated list of allowed origins"},
++		"OLLAMA_OVERRIDE_CONFIG":      {"OLLAMA_OVERRIDE_CONFIG", OverrideConfigPath(), "Path to per-model llama-server overrides (default: ~/.ollama.ini)"},
+ 		"OLLAMA_SCHED_SPREAD":         {"OLLAMA_SCHED_SPREAD", SchedSpread(), "Always schedule model across all GPUs"},
+ 		"OLLAMA_CONTEXT_LENGTH":       {"OLLAMA_CONTEXT_LENGTH", ContextLength(), "Context length to use unless otherwise specified (default: 4k/32k/256k based on VRAM)"},
+ 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
+diff --git a/envconfig/override.go b/envconfig/override.go
+new file mode 100644
+index 0000000..5a288d5
+--- /dev/null
++++ b/envconfig/override.go
+@@ -0,0 +1,121 @@
 +package envconfig
 +
 +import (
 +	"bufio"
++	"errors"
++	"fmt"
++	"math"
 +	"os"
 +	"path/filepath"
++	"strconv"
 +	"strings"
 +)
 +
-+// Override represents per-model overrides for GPU offload behavior.
-+//
-+// NumGPULayers: -1 means unset.
-+// TensorSplit: nil means unset.
++// Override contains per-model llama-server launch overrides.
 +type Override struct {
 +	ModelName    string
-+	NumGPULayers int   // -1 means unset
-+	TensorSplit  []int // nil means unset
++	NumGPULayers int
++	TensorSplit  []int
 +}
 +
-+// LoadOverride loads overrides for the given model section name (e.g. "llama3.2-vision:90b").
-+// The INI format is:
-+//   [model-name]
-+//   tensor-split=<int[,int,...]>
++// LoadOverride loads the override for model from an INI file.
 +//
-+// Note: n-gpu-layers is not read from the file; it is always derived as the sum of tensor-split.
-+// Returns nil if no file or no matching section.
-+func LoadOverride(model string) *Override {
-+	// Resolve config path
++// The supported format is:
++//
++//	[model-name]
++//	tensor-split=20,20,20,20
++//
++// TensorSplit values are passed to llama-server in layer split mode. Because
++// NumGPULayers is their sum, each value is the exact number of offloaded layers
++// assigned to the corresponding GPU.
++func LoadOverride(model string) (*Override, error) {
++	if model == "" {
++		return nil, nil
++	}
++
 +	path := OverrideConfigPath()
 +	if path == "" {
-+		home, _ := os.UserHomeDir()
-+		if home == "" {
-+			return nil
++		home, err := os.UserHomeDir()
++		if err != nil || home == "" {
++			return nil, nil
 +		}
 +		path = filepath.Join(home, ".ollama.ini")
 +	}
 +
 +	f, err := os.Open(path)
-+	if err != nil {
-+		return nil
++	if errors.Is(err, os.ErrNotExist) {
++		return nil, nil
++	} else if err != nil {
++		return nil, fmt.Errorf("open override config %q: %w", path, err)
 +	}
 +	defer f.Close()
 +
-+	sectionHdr := "[" + model + "]"
-+	var inSection bool
-+	ovr := &Override{ModelName: model, NumGPULayers: -1}
++	section := "[" + model + "]"
++	inSection := false
++	lineNumber := 0
 +
-+	sc := bufio.NewScanner(f)
-+	for sc.Scan() {
-+		line := strings.TrimSpace(sc.Text())
++	scanner := bufio.NewScanner(f)
++	for scanner.Scan() {
++		lineNumber++
++		line := strings.TrimSpace(scanner.Text())
 +		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 +			continue
 +		}
++
 +		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-+			inSection = (line == sectionHdr)
++			inSection = line == section
 +			continue
 +		}
 +		if !inSection {
 +			continue
 +		}
-+		kv := strings.SplitN(line, "=", 2)
-+		if len(kv) != 2 {
++
++		key, value, ok := strings.Cut(line, "=")
++		if !ok || !strings.EqualFold(strings.TrimSpace(key), "tensor-split") {
 +			continue
 +		}
-+		k := strings.TrimSpace(strings.ToLower(kv[0]))
-+		v := strings.TrimSpace(kv[1])
 +
-+		switch k {
-+		case "tensor-split":
-+			if arr := parseUintList(v); len(arr) > 0 {
-+				ovr.TensorSplit = arr
-+			}
++		split, err := parsePositiveIntList(value)
++		if err != nil {
++			return nil, fmt.Errorf("parse override config %q line %d: %w", path, lineNumber, err)
 +		}
-+	}
 +
-+	// If a tensor-split is provided, NumGPULayers is always the sum of entries.
-+	if len(ovr.TensorSplit) > 0 {
 +		total := 0
-+		for _, n := range ovr.TensorSplit {
-+			total += n
++		for _, layers := range split {
++			if total > math.MaxInt-layers {
++				return nil, fmt.Errorf("parse override config %q line %d: tensor-split sum overflows int", path, lineNumber)
++			}
++			total += layers
 +		}
-+		ovr.NumGPULayers = total
++
++		return &Override{
++			ModelName:    model,
++			NumGPULayers: total,
++			TensorSplit:  split,
++		}, nil
 +	}
 +
-+	// If nothing set, return nil
-+	if ovr.NumGPULayers < 0 && len(ovr.TensorSplit) == 0 {
-+		return nil
++	if err := scanner.Err(); err != nil {
++		return nil, fmt.Errorf("read override config %q: %w", path, err)
 +	}
-+	return ovr
++
++	return nil, nil
 +}
 +
-+func parseUint(s string) int {
-+	s = strings.TrimSpace(s)
-+	if s == "" {
-+		return -1
++func parsePositiveIntList(value string) ([]int, error) {
++	parts := strings.Split(strings.TrimSpace(value), ",")
++	if len(parts) == 0 || (len(parts) == 1 && strings.TrimSpace(parts[0]) == "") {
++		return nil, errors.New("tensor-split must contain at least one positive integer")
 +	}
-+	var n int
-+	for _, r := range s {
-+		if r < '0' || r > '9' {
-+			return -1
-+		}
-+		n = n*10 + int(r-'0')
-+	}
-+	return n
-+}
 +
-+func parseUintList(s string) []int {
-+	s = strings.TrimSpace(s)
-+	if s == "" {
-+		return nil
-+	}
-+	parts := strings.Split(s, ",")
-+	out := make([]int, 0, len(parts))
-+	for _, p := range parts {
-+		n := parseUint(strings.TrimSpace(p))
-+		if n < 0 {
-+			return nil
++	values := make([]int, 0, len(parts))
++	for _, part := range parts {
++		part = strings.TrimSpace(part)
++		value, err := strconv.Atoi(part)
++		if err != nil || value <= 0 {
++			return nil, fmt.Errorf("tensor-split value %q must be a positive integer", part)
 +		}
-+		out = append(out, n)
++		values = append(values, value)
 +	}
-+	return out
++	return values, nil
 +}
-diff -Nru '--exclude=.git' ollama-0.23.4.org/envconfig/override_test.go ollama-0.23.4/envconfig/override_test.go
---- ollama-0.23.4.org/envconfig/override_test.go	1970-01-01 08:00:00.000000000 +0800
-+++ ollama-0.23.4/envconfig/override_test.go	2026-05-14 23:06:38.712216956 +0700
-@@ -0,0 +1,140 @@
+diff --git a/envconfig/override_test.go b/envconfig/override_test.go
+new file mode 100644
+index 0000000..f1feca6
+--- /dev/null
++++ b/envconfig/override_test.go
+@@ -0,0 +1,109 @@
 +package envconfig
 +
 +import (
@@ -157,455 +163,330 @@ diff -Nru '--exclude=.git' ollama-0.23.4.org/envconfig/override_test.go ollama-0
 +	"testing"
 +)
 +
-+func TestParseUint(t *testing.T) {
++func TestParsePositiveIntList(t *testing.T) {
 +	tests := []struct {
-+		in   string
-+		want int
++		name    string
++		value   string
++		want    []int
++		wantErr bool
 +	}{
-+		{"0", 0},
-+		{"1", 1},
-+		{"123", 123},
-+		{"", -1},
-+		{" 42 ", 42},
-+		{"-1", -1},
-+		{"abc", -1},
-+		{"12x", -1},
++		{name: "single", value: "4", want: []int{4}},
++		{name: "multiple", value: " 10, 20,30 ", want: []int{10, 20, 30}},
++		{name: "empty", value: "", wantErr: true},
++		{name: "zero", value: "1,0", wantErr: true},
++		{name: "negative", value: "1,-2", wantErr: true},
++		{name: "invalid", value: "1,two", wantErr: true},
 +	}
++
 +	for _, tt := range tests {
-+		if got := parseUint(tt.in); got != tt.want {
-+			t.Fatalf("parseUint(%q) = %d; want %d", tt.in, got, tt.want)
-+		}
-+	}
-+}
-+
-+func TestParseUintList(t *testing.T) {
-+	tests := []struct {
-+		in   string
-+		want []int
-+	}{
-+		{"", nil},
-+		{"1", []int{1}},
-+		{"1,2,3", []int{1, 2, 3}},
-+		{" 4 , 5 , 6 ", []int{4, 5, 6}},
-+		{"1, -2", nil}, // invalid -> whole list rejected
-+		{"a,b", nil},
-+	}
-+	for _, tt := range tests {
-+		got := parseUintList(tt.in)
-+		if (got == nil) != (tt.want == nil) {
-+			t.Fatalf("parseUintList(%q) = %v; want %v", tt.in, got, tt.want)
-+		}
-+		if got == nil {
-+			continue
-+		}
-+		if len(got) != len(tt.want) {
-+			t.Fatalf("parseUintList(%q) len=%d; want %d", tt.in, len(got), len(tt.want))
-+		}
-+		for i := range got {
-+			if got[i] != tt.want[i] {
-+				t.Fatalf("parseUintList(%q)[%d]=%d; want %d", tt.in, i, got[i], tt.want[i])
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := parsePositiveIntList(tt.value)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("parsePositiveIntList(%q) error = %v, wantErr %v", tt.value, err, tt.wantErr)
 +			}
-+		}
-+	}
-+}
-+
-+func TestLoadOverride_Basic(t *testing.T) {
-+	dir := t.TempDir()
-+	cfg := filepath.Join(dir, "over.ini")
-+	content := `
-+; comment
-+[llama3.2-vision:90b]
-+n-gpu-layers=33
-+tensor-split=10,20,30
-+
-+[other]
-+n-gpu-layers=1
-+`
-+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Setenv("OLLAMA_OVERRIDE_CONFIG", cfg)
-+
-+	ovr := LoadOverride("llama3.2-vision:90b")
-+	if ovr == nil {
-+		t.Fatalf("LoadOverride returned nil")
-+	}
-+	if ovr.ModelName != "llama3.2-vision:90b" {
-+		t.Fatalf("ModelName=%q; want %q", ovr.ModelName, "llama3.2-vision:90b")
-+	}
-+	// n-gpu-layers must be the sum of tensor-split entries (10+20+30=60).
-+	if ovr.NumGPULayers != 60 {
-+		t.Fatalf("NumGPULayers=%d; want %d", ovr.NumGPULayers, 60)
-+	}
-+	wantSplit := []int{10, 20, 30}
-+	if len(ovr.TensorSplit) != len(wantSplit) {
-+		t.Fatalf("TensorSplit len=%d; want %d", len(ovr.TensorSplit), len(wantSplit))
-+	}
-+	for i := range wantSplit {
-+		if ovr.TensorSplit[i] != wantSplit[i] {
-+			t.Fatalf("TensorSplit[%d]=%d; want %d", i, ovr.TensorSplit[i], wantSplit[i])
-+		}
-+	}
-+}
-+
-+func TestLoadOverride_NoMatchOrEmpty(t *testing.T) {
-+	dir := t.TempDir()
-+	cfg := filepath.Join(dir, "over.ini")
-+	content := `
-+[some-model]
-+n-gpu-layers=7
-+`
-+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Setenv("OLLAMA_OVERRIDE_CONFIG", cfg)
-+
-+	// Section exists but different model -> nil
-+	if got := LoadOverride("another-model"); got != nil {
-+		t.Fatalf("expected nil for unmatched section, got %#v", got)
-+	}
-+
-+	// File missing -> nil
-+	t.Setenv("OLLAMA_OVERRIDE_CONFIG", filepath.Join(dir, "missing.ini"))
-+	if got := LoadOverride("some-model"); got != nil {
-+		t.Fatalf("expected nil for missing file, got %#v", got)
-+	}
-+}
-+
-+func TestLoadOverride_BadValuesIgnored(t *testing.T) {
-+	dir := t.TempDir()
-+	cfg := filepath.Join(dir, "over.ini")
-+	content := `
-+[m]
-+n-gpu-layers=abc
-+tensor-split=1,2,x
-+`
-+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
-+		t.Fatal(err)
-+	}
-+	t.Setenv("OLLAMA_OVERRIDE_CONFIG", cfg)
-+
-+	if got := LoadOverride("m"); got != nil {
-+		t.Fatalf("expected nil when no valid keys parsed, got %#v", got)
-+	}
-+}
-diff -Nru '--exclude=.git' ollama-0.23.4.org/llm/server.go ollama-0.23.4/llm/server.go
---- ollama-0.23.4.org/llm/server.go	2026-05-14 22:42:40.071139886 +0700
-+++ ollama-0.23.4/llm/server.go	2026-05-14 23:06:38.712216956 +0700
-@@ -105,7 +105,8 @@
- 	loadStart    time.Time // Record how long it took the model to load
- 	loadProgress float32
- 
--	sem *semaphore.Weighted
-+	sem      *semaphore.Weighted
-+	override *envconfig.Override
- }
- 
- type llamaServer struct {
-@@ -120,6 +121,129 @@
- 	tokenizer tokenizer.Tokenizer // tokenizer handles text encoding/decoding
- }
- 
-+// buildGPULayersFromOverride constructs an explicit ml.GPULayersList from a
-+// per-model override configuration.
-+//
-+// It takes:
-+//   - totalLayers: the total number of layers in the model (i.e. block_count+1,
-+//     including the output layer).
-+//   - gpus: the visible GPUs, whose order is used to map tensor-split entries to
-+//     device IDs (tensor-split index i -> gpus[i]).
-+//   - override: the parsed override which provides:
-+//       * NumGPULayers: total number of layers to place on GPUs (derived as the sum
-+//         of TensorSplit), and
-+//       * TensorSplit: exact per-GPU layer counts in GPU order.
-+//
-+// Semantics:
-+//   tensor-split=a,b,c,...
-+// means:
-+//   - GPU0 gets exactly a layers
-+//   - GPU1 gets exactly b layers
-+//   - ...
-+// assigned from the START of the model in contiguous order.
-+// Any remaining layers (the last totalLayers-sum(tensor-split)) are left on CPU.
-+//
-+// This matches the requirement that a config like:
-+//   tensor-split=20,20,20,20
-+// on a 100-layer model will place 80 layers on GPUs (20 per GPU, in order) and
-+// leave the last 20 layers on CPU.
-+//
-+// If TensorSplit has more entries than visible GPUs, any entry is <= 0, the sum
-+// is <= 0, or the sum exceeds totalLayers, the function returns nil to signal
-+// "no override".
-+//
-+// On success it returns a non-empty GPULayersList; otherwise it returns nil.
-+func buildGPULayersFromOverride(totalLayers int, gpus []ml.DeviceInfo, override *envconfig.Override) ml.GPULayersList {
-+	if totalLayers <= 0 || len(gpus) == 0 || override == nil {
-+		return nil
-+	}
-+	if len(override.TensorSplit) > len(gpus) {
-+		return nil
-+	}
-+
-+	// Validate and compute total GPU layers
-+	total := 0
-+	for _, n := range override.TensorSplit {
-+		if n <= 0 {
-+			return nil
-+		}
-+		total += n
-+	}
-+	if total <= 0 || total > totalLayers {
-+		return nil
-+	}
-+	// Assign exact, contiguous counts from the start of the model.
-+	// We return entries for all visible GPUs, but only the first len(TensorSplit)
-+	// will receive layers.
-+	gl := make(ml.GPULayersList, len(gpus))
-+	for i := range gpus {
-+		gl[i].DeviceID = gpus[i].DeviceID
-+	}
-+
-+	layer := 0
-+	for i, cnt := range override.TensorSplit {
-+		for j := 0; j < cnt; j++ {
-+			gl[i].Layers = append(gl[i].Layers, layer)
-+			layer++
-+		}
-+	}
-+
-+	if gl.Sum() == 0 {
-+		return nil
-+	}
-+	return gl
-+}
-+
-+// maybeApplyOverride attempts to replace a heuristic GPU layer layout with a
-+// per-model override read from OLLAMA_OVERRIDE_CONFIG.
-+func (s *llmServer) maybeApplyOverride(gpus []ml.DeviceInfo, gpuLayers ml.GPULayersList) (ml.GPULayersList, bool) {
-+	// If no override loaded, or incomplete, bail out
-+	if s.override == nil || s.override.NumGPULayers <= 0 || len(s.override.TensorSplit) == 0 {
-+		return gpuLayers, false
-+	}
-+
-+	// Too many split entries for visible GPUs? Warn and fallback.
-+	if len(s.override.TensorSplit) > len(gpus) {
-+		slog.Warn(
-+			"Override ignored: tensor-split override has more entries than visible GPUs; using heuristic split instead",
-+			"model", s.override.ModelName,
-+			"tensor_split_entries", len(s.override.TensorSplit),
-+			"visible_gpus", len(gpus),
-+		)
-+		return gpuLayers, false
-+	}
-+
-+	// Clamp to model size (totalLayers == block_count + 1)
-+	maxLayers := int(s.totalLayers)
-+	if s.override.NumGPULayers > maxLayers {
-+		slog.Warn(
-+			"Override ignored: n_gpu_layers is larger than the maximum supported; using heuristic split instead",
-+			"model", s.override.ModelName,
-+			"max_layers", maxLayers,
-+			"n_gpu_layers", s.override.NumGPULayers,
-+		)
-+		return gpuLayers, false
-+	}
-+
-+	override := buildGPULayersFromOverride(int(s.totalLayers), gpus, s.override)
-+	if override == nil || override.Sum() == 0 {
-+		slog.Warn("Override ignored: override mapping produced no layers; using heuristic layout instead")
-+		return gpuLayers, false
-+	}
-+
-+	cpuLayers := max(0, int(s.totalLayers)-s.override.NumGPULayers)
-+
-+	slog.Info(
-+		"Applying override from OLLAMA_OVERRIDE_CONFIG",
-+		"model", s.override.ModelName,
-+		"n_gpu_layers", s.override.NumGPULayers,
-+		"cpu_tail_layers", cpuLayers,
-+		"tensor_split", s.override.TensorSplit,
-+		"layers_on_gpu", override.Sum(),
-+	)
-+	return override, true
-+}
-+
- // LoadModel will load a model from disk. The model must be in the GGML format.
- //
- // It collects array values for arrays with a size less than or equal to
-@@ -141,7 +265,7 @@
- }
- 
- // NewLlamaServer will run a server for the given GPUs
--func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
-+func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int, override *envconfig.Override) (LlamaServer, error) {
- 	var llamaModel *llama.Model
- 	var tok tokenizer.Tokenizer
- 	var err error
-@@ -291,6 +415,7 @@
- 		llamaModel:     llamaModel,
- 		llamaModelLock: &sync.Mutex{},
- 		sem:            semaphore.NewWeighted(int64(numParallel)),
-+		override:       override,
- 		totalLayers:    f.KV().BlockCount() + 1,
- 		loadStart:      time.Now(),
- 		done:           make(chan struct{}),
-@@ -671,6 +796,11 @@
- 		}
- 	}
- 
-+	// Apply per-model override
-+	if newLayers, ok := s.maybeApplyOverride(gpus, gpuLayers); ok {
-+		gpuLayers = newLayers
-+	}
-+
- 	// This maintains the historical assignment of graph sizes, though it isn't fully accurate
- 	graphSize := graphFullOffload
- 	if gpuLayers.Sum() < int(s.totalLayers) {
-@@ -799,6 +929,11 @@
- 		return nil, err
- 	}
- 
-+	// Apply per-model override
-+	if newLayers, ok := s.maybeApplyOverride(gpus, gpuLayers); ok {
-+		gpuLayers = newLayers
-+	}
-+
- 	if err := s.waitUntilRunnerLaunched(ctx); err != nil {
- 		return nil, err
- 	}
-@@ -807,6 +942,10 @@
- 	for operation := LoadOperationFit; operation < LoadOperationCommit; operation++ {
- 	nextLoad:
- 		for {
-+			// Apply per-model override if present
-+			if newLayers, ok := s.maybeApplyOverride(gpus, gpuLayers); ok {
-+				gpuLayers = newLayers
++			if len(got) != len(tt.want) {
++				t.Fatalf("parsePositiveIntList(%q) = %v, want %v", tt.value, got, tt.want)
 +			}
- 			s.loadRequest.GPULayers = gpuLayers
- 			resp, err := s.initModel(ctx, s.loadRequest, operation)
- 			if err != nil {
-@@ -824,6 +963,10 @@
- 				if err != nil {
- 					return nil, err
- 				}
-+				// Apply per-model override immediately for consistency
-+				if newLayers, ok := s.maybeApplyOverride(gpus, newGPULayers); ok {
-+					newGPULayers = newLayers
++			for i := range got {
++				if got[i] != tt.want[i] {
++					t.Fatalf("parsePositiveIntList(%q) = %v, want %v", tt.value, got, tt.want)
 +				}
++			}
++		})
++	}
++}
++
++func TestLoadOverride(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "ollama.ini")
++	if err := os.WriteFile(path, []byte(`
++; comment
++[other]
++tensor-split=1
++
++[llama3.2-vision:90b]
++tensor-split=10,20,30
++`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("OLLAMA_OVERRIDE_CONFIG", path)
++
++	override, err := LoadOverride("llama3.2-vision:90b")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if override == nil {
++		t.Fatal("LoadOverride returned nil")
++	}
++	if override.NumGPULayers != 60 {
++		t.Fatalf("NumGPULayers = %d, want 60", override.NumGPULayers)
++	}
++	want := []int{10, 20, 30}
++	for i := range want {
++		if override.TensorSplit[i] != want[i] {
++			t.Fatalf("TensorSplit = %v, want %v", override.TensorSplit, want)
++		}
++	}
++}
++
++func TestLoadOverrideMissingSectionOrFile(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "ollama.ini")
++	if err := os.WriteFile(path, []byte("[other]\ntensor-split=1\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("OLLAMA_OVERRIDE_CONFIG", path)
++
++	override, err := LoadOverride("missing")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if override != nil {
++		t.Fatalf("LoadOverride returned %#v, want nil", override)
++	}
++
++	t.Setenv("OLLAMA_OVERRIDE_CONFIG", filepath.Join(t.TempDir(), "missing.ini"))
++	override, err = LoadOverride("other")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if override != nil {
++		t.Fatalf("LoadOverride returned %#v, want nil", override)
++	}
++}
++
++func TestLoadOverrideRejectsInvalidTensorSplit(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "ollama.ini")
++	if err := os.WriteFile(path, []byte("[model]\ntensor-split=1,0,2\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("OLLAMA_OVERRIDE_CONFIG", path)
++
++	if _, err := LoadOverride("model"); err == nil {
++		t.Fatal("LoadOverride succeeded, want an error")
++	}
++}
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index e529cfc..abf5100 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -408,15 +408,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
  
- 				slog.Debug("new layout created", "layers", newGPULayers)
+ 	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
  
-@@ -860,6 +1003,10 @@
- 						}
- 						slog.Debug("new layout created", "layers", newGPULayers)
+-	// GPU layer offloading — only pass if user explicitly set it (non-default).
+-	// Default behavior: let llama-server auto-detect via -ngl auto.
+-	if launch.opts.NumGPU > 0 {
+-		params = append(params, "-ngl", strconv.Itoa(launch.opts.NumGPU))
+-	} else if launch.opts.NumGPU == 0 {
+-		// Explicit 0 means CPU only
+-		params = append(params, "-ngl", "0")
+-	}
+-	// NumGPU == -1 (default): don't pass -ngl, let llama-server auto-detect
++	params = appendGPUOffloadArgs(params, launch.opts.NumGPU, launch.config.TensorSplit)
  
-+						// Apply per-model override if present
-+						if newLayers, ok := s.maybeApplyOverride(gpus, newGPULayers); ok {
-+							newGPULayers = newLayers
-+						}
- 						s.loadRequest.GPULayers = newGPULayers
- 						resp, err = s.initModel(ctx, s.loadRequest, operation)
- 						if err != nil {
-@@ -874,6 +1021,10 @@
- 							if err != nil {
- 								return nil, err
- 							}
-+							// Apply per-model override for apples-to-apples comparison
-+							if newLayers, ok := s.maybeApplyOverride(gpus, verifyGPULayers); ok {
-+								verifyGPULayers = newLayers
-+							}
- 
- 							slog.Debug("verifying layout", "layers", verifyGPULayers)
- 
-diff -Nru '--exclude=.git' ollama-0.23.4.org/server/routes_generate_test.go ollama-0.23.4/server/routes_generate_test.go
---- ollama-0.23.4.org/server/routes_generate_test.go	2026-05-14 22:42:40.111140084 +0700
-+++ ollama-0.23.4/server/routes_generate_test.go	2026-05-14 23:06:38.712216956 +0700
-@@ -18,6 +18,7 @@
- 	"github.com/google/go-cmp/cmp"
- 
- 	"github.com/ollama/ollama/api"
-+	"github.com/ollama/ollama/envconfig"
- 	"github.com/ollama/ollama/fs/ggml"
- 	"github.com/ollama/ollama/llm"
- 	"github.com/ollama/ollama/manifest"
-@@ -76,8 +77,8 @@
- 
- func (mockRunner) Ping(_ context.Context) error { return nil }
- 
--func newMockServer(mock *mockRunner) func(ml.SystemInfo, []ml.DeviceInfo, string, *ggml.GGML, []string, []string, api.Options, int) (llm.LlamaServer, error) {
--	return func(_ ml.SystemInfo, _ []ml.DeviceInfo, _ string, _ *ggml.GGML, _, _ []string, _ api.Options, _ int) (llm.LlamaServer, error) {
-+func newMockServer(mock *mockRunner) func(ml.SystemInfo, []ml.DeviceInfo, string, *ggml.GGML, []string, []string, api.Options, int, *envconfig.Override) (llm.LlamaServer, error) {
-+	return func(_ ml.SystemInfo, _ []ml.DeviceInfo, _ string, _ *ggml.GGML, _, _ []string, _ api.Options, _ int, _ *envconfig.Override) (llm.LlamaServer, error) {
- 		return mock, nil
- 	}
+ 	// Thread count — only pass if user explicitly set it.
+ 	// Default behavior: let llama-server auto-detect.
+@@ -448,6 +440,25 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+ 	return cmd, port, nil
  }
-diff -Nru '--exclude=.git' ollama-0.23.4.org/server/sched.go ollama-0.23.4/server/sched.go
---- ollama-0.23.4.org/server/sched.go	2026-05-14 22:42:40.115140104 +0700
-+++ ollama-0.23.4/server/sched.go	2026-05-14 23:06:38.716216905 +0700
-@@ -52,7 +52,7 @@
- 	loaded        map[string]*runnerRef
  
- 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
--	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error)
-+	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, override *envconfig.Override) (llm.LlamaServer, error)
- 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
- 	getSystemInfoFn func() ml.SystemInfo
- 	waitForRecovery time.Duration
-@@ -441,7 +441,9 @@
- 				s.loadedMu.Unlock()
++func appendGPUOffloadArgs(params []string, numGPU int, tensorSplit []int) []string {
++	// Default behavior leaves GPU layer selection to llama-server via -ngl auto.
++	if numGPU > 0 {
++		params = append(params, "-ngl", strconv.Itoa(numGPU))
++	} else if numGPU == 0 {
++		params = append(params, "-ngl", "0")
++	}
++
++	if len(tensorSplit) > 0 {
++		values := make([]string, len(tensorSplit))
++		for i, layers := range tensorSplit {
++			values[i] = strconv.Itoa(layers)
++		}
++		params = append(params, "--split-mode", "layer", "--tensor-split", strings.Join(values, ","))
++	}
++
++	return params
++}
++
+ // SetupLlamaServerCommandEnv configures the environment for a llama-server
+ // subprocess so discovery and real model runners use the same library search
+ // paths and GPU backend selection.
+diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
+index d39b5b0..f0414d1 100644
+--- a/llm/llama_server_test.go
++++ b/llm/llama_server_test.go
+@@ -3605,3 +3605,31 @@ func fakeRunningCmd() *exec.Cmd {
+ 	// SIGKILL children when the test process exits.
+ 	return cmd
+ }
++
++func TestAppendGPUOffloadArgs(t *testing.T) {
++	tests := []struct {
++		name        string
++		numGPU      int
++		tensorSplit []int
++		want        []string
++	}{
++		{name: "automatic", numGPU: -1, want: nil},
++		{name: "cpu only", numGPU: 0, want: []string{"-ngl", "0"}},
++		{name: "gpu layers", numGPU: 60, want: []string{"-ngl", "60"}},
++		{
++			name:        "gpu layers with tensor split",
++			numGPU:      60,
++			tensorSplit: []int{10, 20, 30},
++			want:        []string{"-ngl", "60", "--split-mode", "layer", "--tensor-split", "10,20,30"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := appendGPUOffloadArgs(nil, tt.numGPU, tt.tensorSplit)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Fatalf("appendGPUOffloadArgs() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/llm/server.go b/llm/server.go
+index 4f91ddc..91c4461 100644
+--- a/llm/server.go
++++ b/llm/server.go
+@@ -82,6 +82,7 @@ type LlamaServerConfig struct {
+ 	ContextShift   bool
+ 	EnableMTP      bool
+ 	DraftModelPath string
++	TensorSplit    []int
+ }
+ 
+ // LoadModel will load a model from disk. The model must be in the GGML format.
+diff --git a/server/sched.go b/server/sched.go
+index f9ed5cd..b75f928 100644
+--- a/server/sched.go
++++ b/server/sched.go
+@@ -518,6 +518,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+ 	s.loadedMu.Lock()
+ 	llama := s.activeLoading
+ 	var f *ggml.GGML
++	var override *envconfig.Override
+ 	loadGpus := gpus
+ 	var launchOpts api.Options
+ 
+@@ -533,9 +534,40 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  				return false
  			}
--			llama, err = s.newServerFn(systemInfo, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, req.opts, numParallel)
-+			// Load per-model override (by short name)
-+			override := envconfig.LoadOverride(req.model.ShortName)
-+			llama, err = s.newServerFn(systemInfo, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, req.opts, numParallel, override)
+ 
++			loadedOverride, overrideErr := envconfig.LoadOverride(req.model.ShortName)
++			if overrideErr != nil {
++				slog.Warn("ignoring invalid model override", "model", req.model.ShortName, "error", overrideErr)
++			} else if loadedOverride != nil {
++				totalLayers := f.KV().BlockCount() + 1
++				if uint64(loadedOverride.NumGPULayers) > totalLayers {
++					slog.Warn("ignoring model override because tensor-split exceeds model layer count",
++						"model", req.model.ShortName,
++						"tensor_split", loadedOverride.TensorSplit,
++						"gpu_layers", loadedOverride.NumGPULayers,
++						"model_layers", totalLayers)
++				} else if selected, ok := selectTensorSplitPlacement(systemInfo, gpus, len(loadedOverride.TensorSplit)); !ok {
++					slog.Warn("ignoring model override because no compatible GPU group has enough devices",
++						"model", req.model.ShortName,
++						"tensor_split", loadedOverride.TensorSplit)
++				} else {
++					override = loadedOverride
++					loadGpus = selected
++					launchOpts = req.opts
++					launchOpts.NumGPU = override.NumGPULayers
++					launchOpts.MainGPU = nil
++					slog.Info("applying model tensor-split override",
++						"model", req.model.ShortName,
++						"tensor_split", override.TensorSplit,
++						"gpu_layers", override.NumGPULayers,
++						"gpu_count", len(loadGpus))
++				}
++			}
++
+ 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+ 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+-			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
++			if override == nil {
++				loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
++			}
+ 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
+ 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
+ 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
+@@ -575,6 +607,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+ 
+ 			config := llamaServerConfigForModel(req.model)
+ 			config.ContextShift = req.contextShift
++			if override != nil {
++				config.TensorSplit = slices.Clone(override.TensorSplit)
++			}
+ 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
  			if err != nil {
  				// some older models are not compatible with newer versions of llama.cpp
- 				// show a generalized compatibility error until there is a better way to
-diff -Nru '--exclude=.git' ollama-0.23.4.org/server/sched_test.go ollama-0.23.4/server/sched_test.go
---- ollama-0.23.4.org/server/sched_test.go	2026-05-14 22:42:40.115140104 +0700
-+++ ollama-0.23.4/server/sched_test.go	2026-05-14 23:06:38.716216905 +0700
-@@ -12,6 +12,7 @@
- 	"github.com/stretchr/testify/require"
- 
- 	"github.com/ollama/ollama/api"
-+	"github.com/ollama/ollama/envconfig"
- 	"github.com/ollama/ollama/format"
- 	"github.com/ollama/ollama/fs/ggml"
- 	"github.com/ollama/ollama/llm"
-@@ -64,7 +65,7 @@
- 		sessionDuration: &api.Duration{Duration: 2 * time.Second},
- 	}
- 	// Fail to load model first
--	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error) {
-+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, override *envconfig.Override) (llm.LlamaServer, error) {
- 		return nil, errors.New("something failed to load model blah")
- 	}
- 	gpus := []ml.DeviceInfo{}
-@@ -79,7 +80,7 @@
- 	require.Contains(t, err.Error(), "this model may be incompatible")
- 
- 	server := &mockLlm{vramSize: 10, vramByGPU: map[ml.DeviceID]uint64{}}
--	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error) {
-+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, override *envconfig.Override) (llm.LlamaServer, error) {
- 		server.modelPath = model
- 		return server, nil
- 	}
-@@ -135,7 +136,7 @@
- 	req     *LlmRequest
+@@ -975,6 +1010,26 @@ func gpusForPlacement(gpus []ml.DeviceInfo, opts api.Options) []ml.DeviceInfo {
+ 	return gpus
  }
  
--func (scenario *reqBundle) newServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error) {
-+func (scenario *reqBundle) newServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, override *envconfig.Override) (llm.LlamaServer, error) {
- 	scenario.srv.modelPath = model
- 	return scenario.srv, nil
- }
-@@ -568,7 +569,7 @@
- 	gpus := []ml.DeviceInfo{}
- 	systemInfo := ml.SystemInfo{}
- 	server := &mockLlm{vramSize: 10, vramByGPU: map[ml.DeviceID]uint64{}}
--	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int) (llm.LlamaServer, error) {
-+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, override *envconfig.Override) (llm.LlamaServer, error) {
- 		server.modelPath = model
- 		return server, nil
++func selectTensorSplitPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, count int) ([]ml.DeviceInfo, bool) {
++	if count <= 0 {
++		return nil, false
++	}
++
++	candidates := make([][]ml.DeviceInfo, 0)
++	for _, group := range ml.ByLibrary(gpus) {
++		if len(group) < count || len(group) == 0 || strings.EqualFold(group[0].Library, "cpu") {
++			continue
++		}
++		candidates = append(candidates, group[:count])
++	}
++	if len(candidates) == 0 {
++		return nil, false
++	}
++
++	selected := bestGPUGroupByAvailableMemory(systemInfo, candidates)
++	return selected, len(selected) == count
++}
++
+ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, predictedVRAM uint64, opts api.Options) ([]ml.DeviceInfo, api.Options) {
+ 	launchOpts := opts
+ 	if len(gpus) <= 1 || opts.NumGPU == 0 {
+diff --git a/server/sched_test.go b/server/sched_test.go
+index 78505bd..66e6061 100644
+--- a/server/sched_test.go
++++ b/server/sched_test.go
+@@ -1465,6 +1465,35 @@ func TestAvailableMemoryForLoadUsesWorstSharedMemoryMeasurement(t *testing.T) {
  	}
+ }
+ 
++func TestSelectTensorSplitPlacement(t *testing.T) {
++	systemInfo := ml.SystemInfo{FreeMemory: 64 * format.GibiByte}
++	gpus := []ml.DeviceInfo{
++		{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 12 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 12 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, FreeMemory: 7 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, FreeMemory: 7 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "2", Library: "ROCm"}, FreeMemory: 7 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "0", Library: "cpu"}, FreeMemory: 64 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "1", Library: "cpu"}, FreeMemory: 64 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "2", Library: "cpu"}, FreeMemory: 64 * format.GibiByte},
++		{DeviceID: ml.DeviceID{ID: "3", Library: "cpu"}, FreeMemory: 64 * format.GibiByte},
++	}
++
++	selected, ok := selectTensorSplitPlacement(systemInfo, gpus, 2)
++	require.True(t, ok)
++	require.Len(t, selected, 2)
++	require.Equal(t, "CUDA", selected[0].Library)
++
++	selected, ok = selectTensorSplitPlacement(systemInfo, gpus, 3)
++	require.True(t, ok)
++	require.Len(t, selected, 3)
++	require.Equal(t, "ROCm", selected[0].Library)
++
++	selected, ok = selectTensorSplitPlacement(systemInfo, gpus, 4)
++	require.False(t, ok)
++	require.Nil(t, selected)
++}
++
+ func TestSelectLlamaServerPlacement(t *testing.T) {
+ 	systemInfo := ml.SystemInfo{FreeMemory: 14 * format.GigaByte}
+ 

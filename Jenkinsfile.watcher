@@ -55,41 +55,50 @@ pipeline {
           ]
           ci.validateRequiredParameters(externalConfiguration, externalConfiguration.keySet())
 
-          org.shatteredsilicon.jenkins.model.RpmWatcherResult result = rpmWatcher(
-            pipelineName: 'Ollama RPM pipeline',
-            architecture: target.arch,
-            name: 'ollama',
-            supportedArches: ['x86_64'],
-            release: [
-              provider: 'github',
-              repository: 'ollama/ollama'
-            ],
-            repository: [
-              targetCredentialsId: externalConfiguration.RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID,
-              remoteDirectory: "ollama/${target.release}/RPMS/${target.arch}",
-              packageName: 'ollama',
-              architecture: target.arch
-            ],
-            builds: [
-              [
-                job: externalConfiguration.OLLAMA_BUILD_JOB,
-                versionParameter: 'UPSTREAM_TAG',
-                threadParameter: 'THREAD_TS',
-                parameters: [
-                  EPEL: target.release,
-                  ARCH: target.arch,
-                  WITH_AVX: true
-                ],
-                wait: false
+          org.shatteredsilicon.jenkins.model.RpmWatcherResult result
+          try {
+            result = rpmWatcher(
+              pipelineName: 'Ollama RPM pipeline',
+              architecture: target.arch,
+              name: 'ollama',
+              supportedArches: ['x86_64'],
+              release: [
+                provider: 'github',
+                repository: 'ollama/ollama'
+              ],
+              repository: [
+                targetCredentialsId: externalConfiguration.RPM_PACKAGE_SERVER_TARGET_CREDENTIALS_ID,
+                remoteDirectory: "ollama/${target.release}/RPMS/${target.arch}",
+                packageName: 'ollama',
+                architecture: target.arch,
+                strictQuery: true,
+                queryAttempts: 3,
+                queryRetryDelaySeconds: 2
+              ],
+              builds: [
+                [
+                  job: externalConfiguration.OLLAMA_BUILD_JOB,
+                  versionParameter: 'UPSTREAM_TAG',
+                  threadParameter: 'THREAD_TS',
+                  parameters: [
+                    EPEL: target.release,
+                    ARCH: target.arch,
+                    WITH_AVX: true
+                  ],
+                  wait: false
+                ]
+              ],
+              notification: [
+                enabled: target.release == '10',
+                webhookCredentialsId: externalConfiguration.SLACK_WEBHOOK_CREDENTIALS_ID,
+                botTokenCredentialsId: externalConfiguration.SLACK_BOT_TOKEN_CREDENTIALS_ID,
+                channelIdCredentialsId: externalConfiguration.SLACK_CHANNEL_ID_CREDENTIALS_ID
               ]
-            ],
-            notification: [
-              enabled: target.release == '10',
-              webhookCredentialsId: externalConfiguration.SLACK_WEBHOOK_CREDENTIALS_ID,
-              botTokenCredentialsId: externalConfiguration.SLACK_BOT_TOKEN_CREDENTIALS_ID,
-              channelIdCredentialsId: externalConfiguration.SLACK_CHANNEL_ID_CREDENTIALS_ID
-            ]
-          )
+            )
+          } catch (Exception exception) {
+            env.OLLAMA_WATCHER_FAILURE_REASON = (exception.message ?: exception.class.simpleName).take(500)
+            throw exception
+          }
 
           echo "Ollama watcher result for EPEL ${target.release} / ${target.arch}: rebuilds=${result.rebuilds.size()}, current=${result.current.size()}, skipped=${result.skipped.size()}, triggered=${result.triggeredBuilds.size()}"
         }
@@ -111,7 +120,11 @@ pipeline {
             slackCredentialIds.values().every { String value -> value }) {
           slackNotify(
             status: 'error',
-            message: "Ollama watcher failed for EPEL ${releasever} / ${params.ARCH}. Check Jenkins build: ${env.BUILD_URL}",
+            message: "Ollama watcher failed for EPEL ${releasever} / ${params.ARCH}." +
+              ((env.OLLAMA_WATCHER_FAILURE_REASON ?: '').trim()
+                ? " Reason: ${(env.OLLAMA_WATCHER_FAILURE_REASON ?: '').trim()}."
+                : '') +
+              " No downstream build was triggered. Check Jenkins build: ${env.BUILD_URL}",
             pipelineName: 'Ollama RPM pipeline',
             webhookCredentialsId: slackCredentialIds.webhookCredentialsId,
             botTokenCredentialsId: slackCredentialIds.botTokenCredentialsId,

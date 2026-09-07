@@ -51,14 +51,15 @@ can be imported.
 %patch 0 -p1
 %patch 1 -p1
 
-# The root Ollama superbuild treats OLLAMA_LLAMA_CPP_SOURCE as an already
-# prepared tree. Apply Ollama's compatibility patch set, including the local
-# CPU-variant allowlist patch, before configuring the build.
+# The Ollama superbuild treats OLLAMA_LLAMA_CPP_SOURCE as an already prepared
+# tree. Apply the same compatibility patch set that Ollama's FetchContent build
+# uses, including our local CPU-variant allowlist patch, before configuration.
 (
   cd llama.cpp
   cmake \
     -DPATCH_DIR="$PWD/../llama/compat" \
-    -P "$PWD/../llama/compat/apply-patch.cmake"
+    -DPATCH_LABEL="llama/compat" \
+    -P "$PWD/../cmake/apply-git-patches.cmake"
 )
 
 %build

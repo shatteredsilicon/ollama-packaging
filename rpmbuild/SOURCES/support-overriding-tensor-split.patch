@@ -1,8 +1,8 @@
 diff --git a/envconfig/config.go b/envconfig/config.go
-index 61a2c7c..0e3f9e5 100644
+index 0379a2ae..db79b49f 100644
 --- a/envconfig/config.go
 +++ b/envconfig/config.go
-@@ -245,8 +245,9 @@ func String(s string) func() string {
+@@ -247,8 +247,9 @@ func String(s string) func() string {
  }
  
  var (
@@ -14,17 +14,17 @@ index 61a2c7c..0e3f9e5 100644
  
  	CudaVisibleDevices    = String("CUDA_VISIBLE_DEVICES")
  	HipVisibleDevices     = String("HIP_VISIBLE_DEVICES")
-@@ -332,6 +333,7 @@ func AsMap() map[string]EnvVar {
+@@ -334,6 +335,7 @@ func AsMap() map[string]EnvVar {
  		"OLLAMA_NOPRUNE":              {"OLLAMA_NOPRUNE", NoPrune(), "Do not prune model blobs on startup"},
  		"OLLAMA_NUM_PARALLEL":         {"OLLAMA_NUM_PARALLEL", NumParallel(), "Maximum number of parallel requests"},
  		"OLLAMA_ORIGINS":              {"OLLAMA_ORIGINS", AllowedOrigins(), "A comma separated list of allowed origins"},
 +		"OLLAMA_OVERRIDE_CONFIG":      {"OLLAMA_OVERRIDE_CONFIG", OverrideConfigPath(), "Path to per-model llama-server overrides (default: ~/.ollama.ini)"},
  		"OLLAMA_SCHED_SPREAD":         {"OLLAMA_SCHED_SPREAD", SchedSpread(), "Always schedule model across all GPUs"},
  		"OLLAMA_CONTEXT_LENGTH":       {"OLLAMA_CONTEXT_LENGTH", ContextLength(), "Context length to use unless otherwise specified (default: 4k/32k/256k based on VRAM)"},
- 		"OLLAMA_EDITOR":               {"OLLAMA_EDITOR", Editor(), "Path to editor for interactive prompt editing (Ctrl+G)"},
+ 		"OLLAMA_CREATE_REMOTE":        {"OLLAMA_CREATE_REMOTE", CreateRemote(), "Force model creation through the server API even when the server is local"},
 diff --git a/envconfig/override.go b/envconfig/override.go
 new file mode 100644
-index 0000000..5a288d5
+index 00000000..5a288d53
 --- /dev/null
 +++ b/envconfig/override.go
 @@ -0,0 +1,121 @@
@@ -151,7 +151,7 @@ index 0000000..5a288d5
 +}
 diff --git a/envconfig/override_test.go b/envconfig/override_test.go
 new file mode 100644
-index 0000000..f1feca6
+index 00000000..f1feca67
 --- /dev/null
 +++ b/envconfig/override_test.go
 @@ -0,0 +1,109 @@
@@ -265,10 +265,10 @@ index 0000000..f1feca6
 +	}
 +}
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index e529cfc..abf5100 100644
+index f11a6d5d..1f4ba8b7 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -408,15 +408,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+@@ -402,15 +402,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
  
  	params = appendBatchArgs(params, launch.opts, launch.embedding, launch.numParallel)
  
@@ -285,7 +285,7 @@ index e529cfc..abf5100 100644
  
  	// Thread count — only pass if user explicitly set it.
  	// Default behavior: let llama-server auto-detect.
-@@ -448,6 +440,25 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
+@@ -442,6 +434,25 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
  	return cmd, port, nil
  }
  
@@ -312,12 +312,12 @@ index e529cfc..abf5100 100644
  // subprocess so discovery and real model runners use the same library search
  // paths and GPU backend selection.
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index d39b5b0..f0414d1 100644
+index 9b5e57df..4ef323ae 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -3605,3 +3605,31 @@ func fakeRunningCmd() *exec.Cmd {
- 	// SIGKILL children when the test process exits.
- 	return cmd
+@@ -3938,3 +3938,31 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
+ 		t.Errorf("json format converted a schema, %d conversions", got)
+ 	}
  }
 +
 +func TestAppendGPUOffloadArgs(t *testing.T) {
@@ -348,30 +348,30 @@ index d39b5b0..f0414d1 100644
 +	}
 +}
 diff --git a/llm/server.go b/llm/server.go
-index 4f91ddc..91c4461 100644
+index ee8a794f..185c4823 100644
 --- a/llm/server.go
 +++ b/llm/server.go
-@@ -82,6 +82,7 @@ type LlamaServerConfig struct {
- 	ContextShift   bool
- 	EnableMTP      bool
- 	DraftModelPath string
-+	TensorSplit    []int
+@@ -83,6 +83,7 @@ type LlamaServerConfig struct {
+ 	ManifestDigest       string
+ 	DraftModelPath       string
+ 	DraftModelShardPaths []string
++	TensorSplit          []int
  }
  
- // LoadModel will load a model from disk. The model must be in the GGML format.
+ // LoadModel loads GGUF model metadata from disk.
 diff --git a/server/sched.go b/server/sched.go
-index f9ed5cd..b75f928 100644
+index 53549134..1fa78ded 100644
 --- a/server/sched.go
 +++ b/server/sched.go
-@@ -518,6 +518,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+@@ -522,6 +522,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  	s.loadedMu.Lock()
  	llama := s.activeLoading
- 	var f *ggml.GGML
+ 	var f *gguf.Model
 +	var override *envconfig.Override
  	loadGpus := gpus
  	var launchOpts api.Options
  
-@@ -533,9 +534,40 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+@@ -537,9 +538,40 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  				return false
  			}
  
@@ -413,7 +413,7 @@ index f9ed5cd..b75f928 100644
  			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
  			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
  			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
-@@ -575,6 +607,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+@@ -579,6 +611,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  
  			config := llamaServerConfigForModel(req.model)
  			config.ContextShift = req.contextShift
@@ -423,7 +423,7 @@ index f9ed5cd..b75f928 100644
  			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
  			if err != nil {
  				// some older models are not compatible with newer versions of llama.cpp
-@@ -975,6 +1010,26 @@ func gpusForPlacement(gpus []ml.DeviceInfo, opts api.Options) []ml.DeviceInfo {
+@@ -974,6 +1009,26 @@ func gpusForPlacement(gpus []ml.DeviceInfo, opts api.Options) []ml.DeviceInfo {
  	return gpus
  }
  
@@ -451,10 +451,10 @@ index f9ed5cd..b75f928 100644
  	launchOpts := opts
  	if len(gpus) <= 1 || opts.NumGPU == 0 {
 diff --git a/server/sched_test.go b/server/sched_test.go
-index 78505bd..66e6061 100644
+index 829144f5..3434cad4 100644
 --- a/server/sched_test.go
 +++ b/server/sched_test.go
-@@ -1465,6 +1465,35 @@ func TestAvailableMemoryForLoadUsesWorstSharedMemoryMeasurement(t *testing.T) {
+@@ -1491,6 +1491,35 @@ func TestAvailableMemoryForLoadUsesWorstSharedMemoryMeasurement(t *testing.T) {
  	}
  }
  

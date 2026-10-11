@@ -16,6 +16,7 @@ Source2:        %{name}-%{upstream_version}-llama.cpp.tar.gz
 Source3:        %{name}.service
 Source4:        %{name}-user.conf
 Patch0:         restrict-llama-cpu-variants.patch
+# Retained in the SRPM for possible future use; not applied by default.
 Patch1:         support-overriding-tensor-split.patch
 BuildRequires:  cmake >= 3.24
 BuildRequires:  git-core
@@ -49,7 +50,7 @@ can be imported.
 %setup -q -D -a 2
 
 %patch 0 -p1
-%patch 1 -p1
+# Patch1 (tensor-split override) is intentionally not applied.
 
 # The Ollama superbuild treats OLLAMA_LLAMA_CPP_SOURCE as an already prepared
 # tree. Apply the same compatibility patch set that Ollama's FetchContent build

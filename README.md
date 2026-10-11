@@ -113,7 +113,20 @@ The `haswell` runner is the highest selected target and uses AVX2. The
 `alderlake` runner is intentionally excluded because it enables AVX-VNNI. All
 AVX-512 and AMX runners are also excluded.
 
-## Overriding `tensor-split`
+## Overriding `tensor-split` (disabled; retained for future use)
+
+**This feature is NOT included in the RPMs currently built by this repository.**
+The `support-overriding-tensor-split.patch` file remains under
+`rpmbuild/SOURCES/` and is declared as `Patch1` in `ollama.spec` so it is
+retained in the source RPM. However, `%prep` does **not** apply it. Ollama
+therefore uses its upstream automatic GPU placement behavior, and none of the
+configuration options below have any effect on these builds.
+
+To enable this feature in the future, restore `%patch 1 -p1` in the spec's
+`%prep` section, validate that the patch applies to the selected upstream
+Ollama version, and test the resulting behavior before publishing RPMs.
+
+### Reference only: behavior after re-enabling the patch
 
 The `support-overriding-tensor-split.patch` adds a per-model INI configuration
 that overrides Ollama's automatic multi-GPU placement when the model is loaded.

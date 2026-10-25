@@ -1,5 +1,10 @@
 %define debug_package %{nil}
 
+# Build a CUDA 12.9 runner for Pascal (SM61), Volta (SM70), Turing (SM75).
+%global cuda_home /usr/local/cuda-12
+%global cuda_arches 61;70;75
+%global cuda_toolkit_pkg cuda-toolkit-12-9
+
 %bcond_without avx
 
 %{!?upstream_version:%{error:upstream_version must be defined, e.g. rpmbuild --define 'upstream_version 0.32.5'}}
@@ -27,14 +32,13 @@ BuildRequires:  golang >= 1.26.0
 BuildRequires:  gcc-c++
 BuildRequires:  libstdc++
 BuildRequires:  systemd-rpm-macros
-%if 0%{?rhel} <= 9
-BuildRequires:  cuda-toolkit-12-9
-%else
-BuildRequires:  cuda-toolkit-13-1
-%endif
+BuildRequires:  %{cuda_toolkit_pkg}
 %{?sysusers_requires_compat}
 
-Requires: nvidia-driver-cuda-libs libcublas cuda-cudart
+# Do not let unversioned CUDA library requirements pull CUDA 13 on EL10.
+# GPU drivers are provisioned independently; use R580 for SM61/SM70.
+Requires: cuda-cudart-12-9
+Requires: libcublas-12-9
 
 %description
 Ollama is a tool for running AI models on one's own hardware.
@@ -64,6 +68,11 @@ can be imported.
 )
 
 %build
+# Ensure the selected compiler is actually CUDA 12.9, including on EL10.
+test -x %{cuda_home}/bin/nvcc || { echo 'CUDA 12.9 nvcc is missing' >&2; exit 1; }
+%{cuda_home}/bin/nvcc --version | grep -Eq 'release 12\.9([,.]|$)' || {
+  echo 'ERROR: CUDA 12.9 nvcc is required for SM61/70/75' >&2; exit 1;
+}
 %set_build_flags
 export CFLAGS="${CFLAGS} -ffunction-sections -fdata-sections"
 export CXXFLAGS="${CXXFLAGS} -ffunction-sections -fdata-sections"
@@ -74,8 +83,8 @@ export CGO_ENABLED=1
 export OLLAMA_LLAMA_CPP_SOURCE="$PWD/llama.cpp"
 
 # RHEL-family RPM builds link executables as PIE through the hardened linker
-# specs. CUDA 13's compiler probe otherwise compiles a non-PIC host object and
-# fails while linking the test executable. Ollama forwards CMAKE_CUDA_FLAGS to
+# specs. The CUDA compiler probe can otherwise compile a non-PIC host object
+# and fail linking the test executable. Ollama forwards CMAKE_CUDA_FLAGS to
 # each nested llama-server CUDA ExternalProject, so pass the host PIC flag
 # through nvcc explicitly.
 export CUDAFLAGS="${CUDAFLAGS:+$CUDAFLAGS }-Xcompiler=-fPIC"
@@ -89,11 +98,10 @@ export GOAMD64=v2
 export OLLAMA_CPU_VARIANTS='x64;sse42'
 %endif
 
-%if 0%{?rhel} <= 9
-export PATH=/usr/local/cuda-12/bin:$PATH
-%else
-export PATH=/usr/local/cuda-13/bin:$PATH
-%endif
+# Use the versioned CUDA 12 compiler even when /usr/local/cuda points to 13.
+export CUDA_HOME=%{cuda_home}
+export CUDACXX=%{cuda_home}/bin/nvcc
+export PATH=%{cuda_home}/bin:$PATH
 
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
@@ -101,15 +109,12 @@ cmake -S . -B build \
   -DOLLAMA_VERSION=%{version} \
   -DGGML_CPU_VARIANTS="$OLLAMA_CPU_VARIANTS" \
   -DCMAKE_CUDA_FLAGS="$CUDAFLAGS" \
+  -DCMAKE_CUDA_ARCHITECTURES="%{cuda_arches}" \
+  -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DGGML_CUDA_NCCL=OFF \
   -DGGML_LTO=ON \
-%if 0%{?rhel} <= 9
   -DOLLAMA_LLAMA_BACKENDS=cuda_v12 \
-  -DCUDAToolkit_ROOT=/usr/local/cuda-12
-%else
-  -DOLLAMA_LLAMA_BACKENDS=cuda_v13 \
-  -DCUDAToolkit_ROOT=/usr/local/cuda-13 \
-  -DCMAKE_CUDA_ARCHITECTURES='75;86;89;90'
-%endif
+  -DCUDAToolkit_ROOT=%{cuda_home}
 
 cmake --build build --parallel %{?_smp_build_ncpus}
 
